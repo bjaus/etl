@@ -287,7 +287,7 @@ func StripeBatcher[T any, K comparable](keyFn func(T) K, numStripes int, maxBatc
 // over its fmt.Sprint representation.
 func hashKey[K comparable](key K) uint64 {
 	h := fnv.New64a()
-	fmt.Fprint(h, key)
+	_, _ = fmt.Fprint(h, key)
 	return h.Sum64()
 }
 
