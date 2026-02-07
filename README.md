@@ -2,6 +2,8 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/bjaus/etl.svg)](https://pkg.go.dev/github.com/bjaus/etl)
 [![Go Report Card](https://goreportcard.com/badge/github.com/bjaus/etl)](https://goreportcard.com/report/github.com/bjaus/etl)
+[![CI](https://github.com/bjaus/etl/actions/workflows/ci.yml/badge.svg)](https://github.com/bjaus/etl/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/bjaus/etl/branch/main/graph/badge.svg)](https://codecov.io/gh/bjaus/etl)
 
 A flexible, high-performance Extract-Transform-Load pipeline framework for Go with interface-based configuration and checkpoint support.
 
