@@ -584,12 +584,12 @@ func TestStats(t *testing.T) {
 	require.NoError(t, err)
 
 	stats := etl.Stats{}
-	_ = stats.Extracted()
-	_ = stats.Filtered()
-	_ = stats.Transformed()
-	_ = stats.Loaded()
-	_ = stats.Errors()
-	_ = stats.LogValue()
+	stats.Extracted()
+	stats.Filtered()
+	stats.Transformed()
+	stats.Loaded()
+	stats.Errors()
+	stats.LogValue()
 }
 
 // =============================================================================
