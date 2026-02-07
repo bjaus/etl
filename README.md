@@ -25,7 +25,7 @@ A flexible, high-performance Extract-Transform-Load pipeline framework for Go wi
 go get github.com/bjaus/etl
 ```
 
-Requires Go 1.25 or later.
+Requires Go 1.24 or later.
 
 ## Quick Start
 
