@@ -914,3 +914,624 @@ func TestAction_String(t *testing.T) {
 	require.Equal(t, "fail", string(etl.ActionFail))
 	require.Equal(t, "skip", string(etl.ActionSkip))
 }
+
+// =============================================================================
+// Additional Checkpoint Coverage Tests
+// =============================================================================
+
+// filteringCheckpointJob filters all records to test the all-filtered path.
+type filteringCheckpointJob struct {
+	records           []testRecord
+	loaded            [][]testOutput
+	checkpoints       []int
+	clearedCheckpoint bool
+}
+
+var (
+	_ etl.Job[testRecord, testOutput, int]    = (*filteringCheckpointJob)(nil)
+	_ etl.Transformer[testRecord, testOutput] = (*filteringCheckpointJob)(nil)
+	_ etl.Checkpointer[testRecord, int]       = (*filteringCheckpointJob)(nil)
+	_ etl.Filter[testRecord]                  = (*filteringCheckpointJob)(nil)
+)
+
+func (j *filteringCheckpointJob) Extract(_ context.Context, cursor *int) iter.Seq2[testRecord, error] {
+	return extractFrom(j.records)(context.Background(), cursor)
+}
+
+func (j *filteringCheckpointJob) Transform(_ context.Context, src testRecord) (testOutput, error) {
+	return testOutput{ID: src.ID, Doubled: src.Value + src.Value}, nil
+}
+
+func (j *filteringCheckpointJob) Load(_ context.Context, batch []testOutput) error {
+	j.loaded = append(j.loaded, batch)
+	return nil
+}
+
+func (j *filteringCheckpointJob) Include(src testRecord) bool {
+	return false // Filter all records
+}
+
+func (j *filteringCheckpointJob) CheckpointInterval() int { return 2 }
+
+func (j *filteringCheckpointJob) Cursor(src testRecord) int { return src.ID }
+
+func (j *filteringCheckpointJob) LoadCheckpoint(_ context.Context) (*int, *etl.Stats, error) {
+	return nil, nil, nil
+}
+
+func (j *filteringCheckpointJob) SaveCheckpoint(_ context.Context, cursor int, _ *etl.Stats) error {
+	j.checkpoints = append(j.checkpoints, cursor)
+	return nil
+}
+
+func (j *filteringCheckpointJob) ClearCheckpoint(_ context.Context) error {
+	j.clearedCheckpoint = true
+	return nil
+}
+
+func TestPipeline_Checkpointing_AllRecordsFiltered(t *testing.T) {
+	job := &filteringCheckpointJob{
+		records: []testRecord{
+			{ID: 0, Value: "a"},
+			{ID: 1, Value: "b"},
+			{ID: 2, Value: "c"},
+			{ID: 3, Value: "d"},
+		},
+	}
+
+	err := etl.New[testRecord, testOutput, int](job).Run(context.Background())
+	require.NoError(t, err)
+	require.True(t, job.clearedCheckpoint, "Should clear checkpoint on success")
+	require.Empty(t, job.loaded, "No records should be loaded when all filtered")
+}
+
+// slowCheckpointJob allows testing graceful shutdown during checkpoint processing.
+type slowCheckpointJob struct {
+	records           []testRecord
+	loaded            [][]testOutput
+	checkpoints       []int
+	clearedCheckpoint bool
+	extractDelay      time.Duration
+	cancelAfter       int
+	cancelFunc        context.CancelFunc
+	extracted         int
+}
+
+var (
+	_ etl.Job[testRecord, testOutput, int]    = (*slowCheckpointJob)(nil)
+	_ etl.Transformer[testRecord, testOutput] = (*slowCheckpointJob)(nil)
+	_ etl.Checkpointer[testRecord, int]       = (*slowCheckpointJob)(nil)
+)
+
+func (j *slowCheckpointJob) Extract(_ context.Context, cursor *int) iter.Seq2[testRecord, error] {
+	return func(yield func(testRecord, error) bool) {
+		start := 0
+		if cursor != nil {
+			start = *cursor + 1
+		}
+		for i := start; i < len(j.records); i++ {
+			if j.extractDelay > 0 {
+				time.Sleep(j.extractDelay)
+			}
+			j.extracted++
+			if j.cancelAfter > 0 && j.extracted >= j.cancelAfter && j.cancelFunc != nil {
+				j.cancelFunc()
+			}
+			if !yield(j.records[i], nil) {
+				return
+			}
+		}
+	}
+}
+
+func (j *slowCheckpointJob) Transform(_ context.Context, src testRecord) (testOutput, error) {
+	return testOutput{ID: src.ID, Doubled: src.Value + src.Value}, nil
+}
+
+func (j *slowCheckpointJob) Load(_ context.Context, batch []testOutput) error {
+	j.loaded = append(j.loaded, batch)
+	return nil
+}
+
+func (j *slowCheckpointJob) CheckpointInterval() int { return 2 }
+
+func (j *slowCheckpointJob) Cursor(src testRecord) int { return src.ID }
+
+func (j *slowCheckpointJob) LoadCheckpoint(_ context.Context) (*int, *etl.Stats, error) {
+	return nil, nil, nil
+}
+
+func (j *slowCheckpointJob) SaveCheckpoint(_ context.Context, cursor int, _ *etl.Stats) error {
+	j.checkpoints = append(j.checkpoints, cursor)
+	return nil
+}
+
+func (j *slowCheckpointJob) ClearCheckpoint(_ context.Context) error {
+	j.clearedCheckpoint = true
+	return nil
+}
+
+func TestPipeline_Checkpointing_GracefulShutdownDuringEpoch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &slowCheckpointJob{
+		records: []testRecord{
+			{ID: 0, Value: "a"},
+			{ID: 1, Value: "b"},
+			{ID: 2, Value: "c"},
+			{ID: 3, Value: "d"},
+			{ID: 4, Value: "e"},
+			{ID: 5, Value: "f"},
+		},
+		cancelAfter: 3, // Cancel after extracting 3 records
+		cancelFunc:  cancel,
+	}
+
+	err := etl.New[testRecord, testOutput, int](job).
+		WithDrainTimeout(5 * time.Second).
+		Run(ctx)
+	require.NoError(t, err)
+	// Should have saved a checkpoint since we cancelled mid-processing
+	require.NotEmpty(t, job.checkpoints, "Should have saved checkpoint during graceful shutdown")
+}
+
+// checkpointTransformErrorJob tests error handling during transform in checkpoint mode.
+type checkpointTransformErrorJob struct {
+	records           []testRecord
+	loaded            [][]testOutput
+	checkpoints       []int
+	clearedCheckpoint bool
+	transformCount    int
+	failAfter         int
+}
+
+var (
+	_ etl.Job[testRecord, testOutput, int]    = (*checkpointTransformErrorJob)(nil)
+	_ etl.Transformer[testRecord, testOutput] = (*checkpointTransformErrorJob)(nil)
+	_ etl.Checkpointer[testRecord, int]       = (*checkpointTransformErrorJob)(nil)
+	_ etl.ErrorHandler                        = (*checkpointTransformErrorJob)(nil)
+)
+
+func (j *checkpointTransformErrorJob) Extract(_ context.Context, cursor *int) iter.Seq2[testRecord, error] {
+	return extractFrom(j.records)(context.Background(), cursor)
+}
+
+func (j *checkpointTransformErrorJob) Transform(_ context.Context, src testRecord) (testOutput, error) {
+	j.transformCount++
+	if j.failAfter > 0 && j.transformCount > j.failAfter {
+		return testOutput{}, errors.New("transform error")
+	}
+	return testOutput{ID: src.ID, Doubled: src.Value + src.Value}, nil
+}
+
+func (j *checkpointTransformErrorJob) Load(_ context.Context, batch []testOutput) error {
+	j.loaded = append(j.loaded, batch)
+	return nil
+}
+
+func (j *checkpointTransformErrorJob) OnError(_ context.Context, stage etl.Stage, _ error) etl.Action {
+	if stage == etl.StageTransform {
+		return etl.ActionSkip
+	}
+	return etl.ActionFail
+}
+
+func (j *checkpointTransformErrorJob) CheckpointInterval() int { return 3 }
+
+func (j *checkpointTransformErrorJob) Cursor(src testRecord) int { return src.ID }
+
+func (j *checkpointTransformErrorJob) LoadCheckpoint(_ context.Context) (*int, *etl.Stats, error) {
+	return nil, nil, nil
+}
+
+func (j *checkpointTransformErrorJob) SaveCheckpoint(_ context.Context, cursor int, _ *etl.Stats) error {
+	j.checkpoints = append(j.checkpoints, cursor)
+	return nil
+}
+
+func (j *checkpointTransformErrorJob) ClearCheckpoint(_ context.Context) error {
+	j.clearedCheckpoint = true
+	return nil
+}
+
+func TestPipeline_Checkpointing_TransformErrorSkip(t *testing.T) {
+	job := &checkpointTransformErrorJob{
+		records: []testRecord{
+			{ID: 0, Value: "a"},
+			{ID: 1, Value: "b"},
+			{ID: 2, Value: "c"},
+			{ID: 3, Value: "d"},
+		},
+		failAfter: 2, // Fail on 3rd and 4th transforms
+	}
+
+	err := etl.New[testRecord, testOutput, int](job).Run(context.Background())
+	require.NoError(t, err)
+	require.True(t, job.clearedCheckpoint)
+}
+
+// checkpointLoadErrorJob tests error handling during load in checkpoint mode.
+type checkpointLoadErrorJob struct {
+	records           []testRecord
+	loadCount         int
+	failAfter         int
+	checkpoints       []int
+	clearedCheckpoint bool
+}
+
+var (
+	_ etl.Job[testRecord, testOutput, int]    = (*checkpointLoadErrorJob)(nil)
+	_ etl.Transformer[testRecord, testOutput] = (*checkpointLoadErrorJob)(nil)
+	_ etl.Checkpointer[testRecord, int]       = (*checkpointLoadErrorJob)(nil)
+	_ etl.ErrorHandler                        = (*checkpointLoadErrorJob)(nil)
+)
+
+func (j *checkpointLoadErrorJob) Extract(_ context.Context, cursor *int) iter.Seq2[testRecord, error] {
+	return extractFrom(j.records)(context.Background(), cursor)
+}
+
+func (j *checkpointLoadErrorJob) Transform(_ context.Context, src testRecord) (testOutput, error) {
+	return testOutput{ID: src.ID, Doubled: src.Value + src.Value}, nil
+}
+
+func (j *checkpointLoadErrorJob) Load(_ context.Context, _ []testOutput) error {
+	j.loadCount++
+	if j.failAfter > 0 && j.loadCount > j.failAfter {
+		return errors.New("load error")
+	}
+	return nil
+}
+
+func (j *checkpointLoadErrorJob) OnError(_ context.Context, stage etl.Stage, _ error) etl.Action {
+	if stage == etl.StageLoad {
+		return etl.ActionSkip
+	}
+	return etl.ActionFail
+}
+
+func (j *checkpointLoadErrorJob) CheckpointInterval() int { return 2 }
+
+func (j *checkpointLoadErrorJob) Cursor(src testRecord) int { return src.ID }
+
+func (j *checkpointLoadErrorJob) LoadCheckpoint(_ context.Context) (*int, *etl.Stats, error) {
+	return nil, nil, nil
+}
+
+func (j *checkpointLoadErrorJob) SaveCheckpoint(_ context.Context, cursor int, _ *etl.Stats) error {
+	j.checkpoints = append(j.checkpoints, cursor)
+	return nil
+}
+
+func (j *checkpointLoadErrorJob) ClearCheckpoint(_ context.Context) error {
+	j.clearedCheckpoint = true
+	return nil
+}
+
+func TestPipeline_Checkpointing_LoadErrorSkip(t *testing.T) {
+	job := &checkpointLoadErrorJob{
+		records: []testRecord{
+			{ID: 0, Value: "a"},
+			{ID: 1, Value: "b"},
+			{ID: 2, Value: "c"},
+			{ID: 3, Value: "d"},
+		},
+		failAfter: 1, // Fail on 2nd load
+	}
+
+	err := etl.New[testRecord, testOutput, int](job).Run(context.Background())
+	require.NoError(t, err)
+	require.True(t, job.clearedCheckpoint)
+}
+
+// checkpointProgressJob tests progress reporting in checkpoint mode.
+type checkpointProgressJob struct {
+	records           []testRecord
+	loaded            [][]testOutput
+	checkpoints       []int
+	clearedCheckpoint bool
+	progressCalls     int
+}
+
+var (
+	_ etl.Job[testRecord, testOutput, int]    = (*checkpointProgressJob)(nil)
+	_ etl.Transformer[testRecord, testOutput] = (*checkpointProgressJob)(nil)
+	_ etl.Checkpointer[testRecord, int]       = (*checkpointProgressJob)(nil)
+	_ etl.ProgressReporter                    = (*checkpointProgressJob)(nil)
+)
+
+func (j *checkpointProgressJob) Extract(_ context.Context, cursor *int) iter.Seq2[testRecord, error] {
+	return extractFrom(j.records)(context.Background(), cursor)
+}
+
+func (j *checkpointProgressJob) Transform(_ context.Context, src testRecord) (testOutput, error) {
+	return testOutput{ID: src.ID, Doubled: src.Value + src.Value}, nil
+}
+
+func (j *checkpointProgressJob) Load(_ context.Context, batch []testOutput) error {
+	j.loaded = append(j.loaded, batch)
+	return nil
+}
+
+func (j *checkpointProgressJob) ReportInterval() int { return 2 }
+
+func (j *checkpointProgressJob) OnProgress(_ context.Context, _ *etl.Stats) {
+	j.progressCalls++
+}
+
+func (j *checkpointProgressJob) CheckpointInterval() int { return 3 }
+
+func (j *checkpointProgressJob) Cursor(src testRecord) int { return src.ID }
+
+func (j *checkpointProgressJob) LoadCheckpoint(_ context.Context) (*int, *etl.Stats, error) {
+	return nil, nil, nil
+}
+
+func (j *checkpointProgressJob) SaveCheckpoint(_ context.Context, cursor int, _ *etl.Stats) error {
+	j.checkpoints = append(j.checkpoints, cursor)
+	return nil
+}
+
+func (j *checkpointProgressJob) ClearCheckpoint(_ context.Context) error {
+	j.clearedCheckpoint = true
+	return nil
+}
+
+func TestPipeline_Checkpointing_ProgressReporting(t *testing.T) {
+	job := &checkpointProgressJob{
+		records: []testRecord{
+			{ID: 0, Value: "a"},
+			{ID: 1, Value: "b"},
+			{ID: 2, Value: "c"},
+			{ID: 3, Value: "d"},
+			{ID: 4, Value: "e"},
+			{ID: 5, Value: "f"},
+		},
+	}
+
+	err := etl.New[testRecord, testOutput, int](job).Run(context.Background())
+	require.NoError(t, err)
+	require.True(t, job.clearedCheckpoint)
+	require.Greater(t, job.progressCalls, 0, "Progress should have been reported")
+}
+
+// checkpointExtractErrorJob tests extract error handling in checkpoint mode.
+type checkpointExtractErrorJob struct {
+	records           []testRecord
+	loaded            [][]testOutput
+	checkpoints       []int
+	clearedCheckpoint bool
+	extractCount      int
+	failAfter         int
+}
+
+var (
+	_ etl.Job[testRecord, testOutput, int]    = (*checkpointExtractErrorJob)(nil)
+	_ etl.Transformer[testRecord, testOutput] = (*checkpointExtractErrorJob)(nil)
+	_ etl.Checkpointer[testRecord, int]       = (*checkpointExtractErrorJob)(nil)
+	_ etl.ErrorHandler                        = (*checkpointExtractErrorJob)(nil)
+)
+
+func (j *checkpointExtractErrorJob) Extract(_ context.Context, cursor *int) iter.Seq2[testRecord, error] {
+	return func(yield func(testRecord, error) bool) {
+		start := 0
+		if cursor != nil {
+			start = *cursor + 1
+		}
+		for i := start; i < len(j.records); i++ {
+			j.extractCount++
+			if j.failAfter > 0 && j.extractCount > j.failAfter {
+				if !yield(testRecord{}, errors.New("extract error")) {
+					return
+				}
+				continue
+			}
+			if !yield(j.records[i], nil) {
+				return
+			}
+		}
+	}
+}
+
+func (j *checkpointExtractErrorJob) Transform(_ context.Context, src testRecord) (testOutput, error) {
+	return testOutput{ID: src.ID, Doubled: src.Value + src.Value}, nil
+}
+
+func (j *checkpointExtractErrorJob) Load(_ context.Context, batch []testOutput) error {
+	j.loaded = append(j.loaded, batch)
+	return nil
+}
+
+func (j *checkpointExtractErrorJob) OnError(_ context.Context, stage etl.Stage, _ error) etl.Action {
+	if stage == etl.StageExtract {
+		return etl.ActionSkip
+	}
+	return etl.ActionFail
+}
+
+func (j *checkpointExtractErrorJob) CheckpointInterval() int { return 3 }
+
+func (j *checkpointExtractErrorJob) Cursor(src testRecord) int { return src.ID }
+
+func (j *checkpointExtractErrorJob) LoadCheckpoint(_ context.Context) (*int, *etl.Stats, error) {
+	return nil, nil, nil
+}
+
+func (j *checkpointExtractErrorJob) SaveCheckpoint(_ context.Context, cursor int, _ *etl.Stats) error {
+	j.checkpoints = append(j.checkpoints, cursor)
+	return nil
+}
+
+func (j *checkpointExtractErrorJob) ClearCheckpoint(_ context.Context) error {
+	j.clearedCheckpoint = true
+	return nil
+}
+
+func TestPipeline_Checkpointing_ExtractErrorSkip(t *testing.T) {
+	job := &checkpointExtractErrorJob{
+		records: []testRecord{
+			{ID: 0, Value: "a"},
+			{ID: 1, Value: "b"},
+			{ID: 2, Value: "c"},
+			{ID: 3, Value: "d"},
+		},
+		failAfter: 2, // Fail on 3rd extract
+	}
+
+	err := etl.New[testRecord, testOutput, int](job).Run(context.Background())
+	require.NoError(t, err)
+	require.True(t, job.clearedCheckpoint)
+}
+
+// saveCheckpointShutdownErrorJob tests save checkpoint error during graceful shutdown.
+type saveCheckpointShutdownErrorJob struct {
+	records           []testRecord
+	loaded            [][]testOutput
+	clearedCheckpoint bool
+	cancelFunc        context.CancelFunc
+	extracted         int
+	cancelAfter       int
+}
+
+var (
+	_ etl.Job[testRecord, testOutput, int]    = (*saveCheckpointShutdownErrorJob)(nil)
+	_ etl.Transformer[testRecord, testOutput] = (*saveCheckpointShutdownErrorJob)(nil)
+	_ etl.Checkpointer[testRecord, int]       = (*saveCheckpointShutdownErrorJob)(nil)
+)
+
+func (j *saveCheckpointShutdownErrorJob) Extract(_ context.Context, cursor *int) iter.Seq2[testRecord, error] {
+	return func(yield func(testRecord, error) bool) {
+		start := 0
+		if cursor != nil {
+			start = *cursor + 1
+		}
+		for i := start; i < len(j.records); i++ {
+			j.extracted++
+			if j.cancelAfter > 0 && j.extracted >= j.cancelAfter && j.cancelFunc != nil {
+				j.cancelFunc()
+			}
+			if !yield(j.records[i], nil) {
+				return
+			}
+		}
+	}
+}
+
+func (j *saveCheckpointShutdownErrorJob) Transform(_ context.Context, src testRecord) (testOutput, error) {
+	return testOutput{ID: src.ID, Doubled: src.Value + src.Value}, nil
+}
+
+func (j *saveCheckpointShutdownErrorJob) Load(_ context.Context, batch []testOutput) error {
+	j.loaded = append(j.loaded, batch)
+	return nil
+}
+
+func (j *saveCheckpointShutdownErrorJob) CheckpointInterval() int { return 2 }
+
+func (j *saveCheckpointShutdownErrorJob) Cursor(src testRecord) int { return src.ID }
+
+func (j *saveCheckpointShutdownErrorJob) LoadCheckpoint(_ context.Context) (*int, *etl.Stats, error) {
+	return nil, nil, nil
+}
+
+func (j *saveCheckpointShutdownErrorJob) SaveCheckpoint(_ context.Context, _ int, _ *etl.Stats) error {
+	return errors.New("save checkpoint during shutdown failed")
+}
+
+func (j *saveCheckpointShutdownErrorJob) ClearCheckpoint(_ context.Context) error {
+	j.clearedCheckpoint = true
+	return nil
+}
+
+func TestPipeline_Checkpointing_SaveCheckpointErrorDuringShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &saveCheckpointShutdownErrorJob{
+		records: []testRecord{
+			{ID: 0, Value: "a"},
+			{ID: 1, Value: "b"},
+			{ID: 2, Value: "c"},
+			{ID: 3, Value: "d"},
+			{ID: 4, Value: "e"},
+			{ID: 5, Value: "f"},
+		},
+		cancelAfter: 3,
+		cancelFunc:  cancel,
+	}
+
+	err := etl.New[testRecord, testOutput, int](job).
+		WithDrainTimeout(5 * time.Second).
+		Run(ctx)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "save checkpoint during shutdown")
+}
+
+// cancelBetweenEpochsJob cancels context after first checkpoint save (between epochs).
+type cancelBetweenEpochsJob struct {
+	records           []testRecord
+	loaded            [][]testOutput
+	checkpoints       []int
+	clearedCheckpoint bool
+	cancelFunc        context.CancelFunc
+}
+
+var (
+	_ etl.Job[testRecord, testOutput, int]    = (*cancelBetweenEpochsJob)(nil)
+	_ etl.Transformer[testRecord, testOutput] = (*cancelBetweenEpochsJob)(nil)
+	_ etl.Checkpointer[testRecord, int]       = (*cancelBetweenEpochsJob)(nil)
+)
+
+func (j *cancelBetweenEpochsJob) Extract(_ context.Context, cursor *int) iter.Seq2[testRecord, error] {
+	return extractFrom(j.records)(context.Background(), cursor)
+}
+
+func (j *cancelBetweenEpochsJob) Transform(_ context.Context, src testRecord) (testOutput, error) {
+	return testOutput{ID: src.ID, Doubled: src.Value + src.Value}, nil
+}
+
+func (j *cancelBetweenEpochsJob) Load(_ context.Context, batch []testOutput) error {
+	j.loaded = append(j.loaded, batch)
+	return nil
+}
+
+func (j *cancelBetweenEpochsJob) CheckpointInterval() int { return 2 }
+
+func (j *cancelBetweenEpochsJob) Cursor(src testRecord) int { return src.ID }
+
+func (j *cancelBetweenEpochsJob) LoadCheckpoint(_ context.Context) (*int, *etl.Stats, error) {
+	return nil, nil, nil
+}
+
+func (j *cancelBetweenEpochsJob) SaveCheckpoint(_ context.Context, cursor int, _ *etl.Stats) error {
+	j.checkpoints = append(j.checkpoints, cursor)
+	// Cancel after first checkpoint save - this triggers cancellation between epochs
+	if len(j.checkpoints) == 1 && j.cancelFunc != nil {
+		j.cancelFunc()
+	}
+	return nil
+}
+
+func (j *cancelBetweenEpochsJob) ClearCheckpoint(_ context.Context) error {
+	j.clearedCheckpoint = true
+	return nil
+}
+
+func TestPipeline_Checkpointing_CancelBeforeNewEpoch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &cancelBetweenEpochsJob{
+		records: []testRecord{
+			{ID: 0, Value: "a"},
+			{ID: 1, Value: "b"},
+			{ID: 2, Value: "c"},
+			{ID: 3, Value: "d"},
+			{ID: 4, Value: "e"},
+			{ID: 5, Value: "f"},
+		},
+		cancelFunc: cancel,
+	}
+
+	err := etl.New[testRecord, testOutput, int](job).
+		WithDrainTimeout(5 * time.Second).
+		Run(ctx)
+	require.NoError(t, err)
+	// Should have saved exactly one checkpoint (first epoch) then exited cleanly
+	require.Equal(t, 1, len(job.checkpoints), "Should have saved one checkpoint before cancellation")
+	require.False(t, job.clearedCheckpoint, "Should not clear checkpoint on graceful shutdown")
+}
